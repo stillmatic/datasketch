@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import struct
 import warnings
+from collections.abc import Iterable
 from typing import Callable, Optional
 
 import numpy as np
@@ -14,6 +15,17 @@ except ImportError:
     from hyperloglog_const import _bias, _raw_estimate, _thresholds
 
 from datasketch.hashfunc import sha1_hash32, sha1_hash64
+
+# Rust accelerated backend (optional)
+try:
+    from datasketch._rs import hll64_update as _rs_hll64_update
+    from datasketch._rs import hll64_update_batch as _rs_hll64_update_batch
+    from datasketch._rs import hll_update as _rs_hll_update
+    from datasketch._rs import hll_update_batch as _rs_hll_update_batch
+
+    _HAS_RS = True
+except ImportError:
+    _HAS_RS = False
 
 # Get the number of bits starting from the first non-zero bit to the right
 _bit_length = lambda bits: bits.bit_length()
@@ -46,7 +58,7 @@ class HyperLogLog:
 
     """
 
-    __slots__ = ("alpha", "hashfunc", "m", "max_rank", "p", "reg")
+    __slots__ = ("_use_rs", "alpha", "hashfunc", "m", "max_rank", "p", "reg")
 
     # The range of the hash values used for HyperLogLog
     _hash_range_bit = 32
@@ -96,6 +108,8 @@ class HyperLogLog:
         if hashobj is not None:
             warnings.warn("hashobj is deprecated, use hashfunc instead.", DeprecationWarning, stacklevel=2)
         self.hashfunc = hashfunc
+        # Rust fast path: use when available and using default hashfunc
+        self._use_rs = _HAS_RS and hashfunc is sha1_hash32
         # Common settings
         self.alpha = self._get_alpha(self.p)
         self.max_rank = self._hash_range_bit - self.p
@@ -132,14 +146,72 @@ class HyperLogLog:
                 hll.update("new value")
 
         """
+        if self._use_rs:
+            _rs_hll_update(b, self.p, self.max_rank, self.reg)
+            return
         # Digest the hash object to get the hash value
         hv = self.hashfunc(b)
         # Get the index of the register using the first p bits of the hash
         reg_index = hv & (self.m - 1)
-        # Get the rest of the hash
+        # Get the rest of the hash and compute rank inline
         bits = hv >> self.p
+        rank = self.max_rank - bits.bit_length() + 1
+        if rank <= 0:
+            raise ValueError(
+                "Hash value overflow, maximum size is %d\
+                    bits"
+                % self.max_rank
+            )
         # Update the register
-        self.reg[reg_index] = max(self.reg[reg_index], self._get_rank(bits))
+        self.reg[reg_index] = max(self.reg[reg_index], rank)
+
+    def update_batch(self, b: Iterable) -> None:
+        """Update the HyperLogLog with multiple data values at once.
+
+        This is significantly faster than calling :meth:`update` in a loop
+        because it vectorizes the hash-to-register mapping using NumPy.
+
+        Args:
+            b (Iterable): Values to be hashed using the hash function specified.
+
+        Example:
+            .. code-block:: python
+
+                hll = HyperLogLog()
+                hll.update_batch([f"item-{i}".encode("utf-8") for i in range(1000)])
+
+        """
+        if self._use_rs:
+            data_list = list(b)
+            if not data_list:
+                return
+            _rs_hll_update_batch(data_list, self.p, self.max_rank, self.reg)
+            return
+        # Hash all items on CPU
+        hv_list = [self.hashfunc(_b) for _b in b]
+        if not hv_list:
+            return
+        hv = np.array(hv_list, dtype=np.uint64)
+        # Extract register indices (first p bits)
+        reg_indices = (hv & np.uint64(self.m - 1)).astype(np.intp)
+        # Extract remaining bits and compute ranks
+        bits = hv >> np.uint64(self.p)
+        # Vectorized rank computation: max_rank - bit_length + 1
+        # For numpy arrays, we compute bit_length via log2
+        # bit_length(x) = floor(log2(x)) + 1 for x > 0, 0 for x == 0
+        nonzero = bits > 0
+        bit_lengths = np.zeros(len(bits), dtype=np.int8)
+        if np.any(nonzero):
+            bit_lengths[nonzero] = np.floor(np.log2(bits[nonzero].astype(np.float64))).astype(np.int8) + 1
+        ranks = np.int8(self.max_rank) - bit_lengths + np.int8(1)
+        if np.any(ranks <= 0):
+            raise ValueError(
+                "Hash value overflow, maximum size is %d\
+                    bits"
+                % self.max_rank
+            )
+        # Vectorized register update using np.maximum.at
+        np.maximum.at(self.reg, reg_indices, ranks)
 
     def count(self) -> float:
         """Estimate the cardinality of the data values seen so far.
@@ -356,6 +428,25 @@ class HyperLogLogPlusPlus(HyperLogLog):
         hashobj: Optional[object] = None,
     ):
         super(HyperLogLogPlusPlus, self).__init__(p=p, reg=reg, hashfunc=hashfunc, hashobj=hashobj)
+        # Override: HLL++ uses 64-bit hash functions
+        self._use_rs = _HAS_RS and hashfunc is sha1_hash64
+
+    def update(self, b) -> None:
+        """Update the HyperLogLog++ with a new data value."""
+        if self._use_rs:
+            _rs_hll64_update(b, self.p, self.max_rank, self.reg)
+            return
+        super().update(b)
+
+    def update_batch(self, b: Iterable) -> None:
+        """Update the HyperLogLog++ with multiple data values at once."""
+        if self._use_rs:
+            data_list = list(b)
+            if not data_list:
+                return
+            _rs_hll64_update_batch(data_list, self.p, self.max_rank, self.reg)
+            return
+        super().update_batch(b)
 
     def _get_threshold(self, p):
         return _thresholds[p - 4]

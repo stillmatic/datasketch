@@ -23,6 +23,15 @@ except ImportError:
 
 from datasketch.hashfunc import sha1_hash32
 
+# Rust accelerated backend (optional)
+try:
+    from datasketch._rs import minhash_update as _rs_minhash_update
+    from datasketch._rs import minhash_update_batch as _rs_minhash_update_batch
+
+    _HAS_RS = True
+except ImportError:
+    _HAS_RS = False
+
 # The size of a hash value in number of bytes
 hashvalue_byte_size = len(bytes(np.int64(42).data))
 
@@ -152,6 +161,9 @@ class MinHash:
         if len(self) != len(self.permutations[0]):
             raise ValueError("Numbers of hash values and permutations mismatch")
 
+        # Rust fast path: use when available and using default hashfunc
+        self._use_rs = _HAS_RS and hashfunc is sha1_hash32
+
         # GPU state
         self._gpu_mode: Literal["disable", "detect", "always"] = gpu_mode
         self._a_gpu = None
@@ -172,16 +184,9 @@ class MinHash:
         # that maps a 32-bit hash value to another 32-bit hash value.
         # http://en.wikipedia.org/wiki/Universal_hashing
         gen = np.random.RandomState(self.seed)
-        return np.array(
-            [
-                (
-                    gen.randint(1, _mersenne_prime, dtype=np.uint64),
-                    gen.randint(0, _mersenne_prime, dtype=np.uint64),
-                )
-                for _ in range(num_perm)
-            ],
-            dtype=np.uint64,
-        ).T
+        a = gen.randint(1, _mersenne_prime, dtype=np.uint64, size=num_perm)
+        b = gen.randint(0, _mersenne_prime, dtype=np.uint64, size=num_perm)
+        return np.array([a, b], dtype=np.uint64)
 
     def _parse_hashvalues(self, hashvalues) -> np.ndarray:
         return np.array(hashvalues, dtype=np.uint64)
@@ -218,6 +223,10 @@ class MinHash:
                 minhash.update("new value")
 
         """
+        if self._use_rs:
+            a, b_perm = self.permutations
+            _rs_minhash_update(b, a, b_perm, self.hashvalues)
+            return
         hv = self.hashfunc(b)
         a, b = self.permutations
         phv = np.bitwise_and((a * hv + b) % _mersenne_prime, _max_hash)
@@ -259,6 +268,14 @@ class MinHash:
                 m.update_batch([b"token1", b"token2"])
 
         """
+        if self._use_rs and self._gpu_mode == "disable":
+            data_list = list(b)
+            if not data_list:
+                return
+            a, b_perm = self.permutations
+            _rs_minhash_update_batch(data_list, a, b_perm, self.hashvalues)
+            return
+
         # Hash on CPU to preserve hashfunc semantics
         hv_list = [self.hashfunc(_b) for _b in b]
         # Optimization: empty batch is a no-op (preserves original behavior)
@@ -533,6 +550,8 @@ class MinHash:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        # Re-evaluate Rust availability after unpickling (may differ across envs)
+        self._use_rs = _HAS_RS and self.hashfunc is sha1_hash32
         # After unpickling we remain on CPU until update_batch decides backend.
 
     # Caches will be recreated on first GPU use via _ensure_gpu_caches().

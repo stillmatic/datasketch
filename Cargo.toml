@@ -1,0 +1,13 @@
+[package]
+name = "datasketch"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
+numpy = "0.22"

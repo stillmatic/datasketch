@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import pickle
 import struct
 from collections.abc import Hashable
@@ -30,6 +31,7 @@ def _false_negative_probability(threshold, b, r):
     return a
 
 
+@functools.lru_cache(maxsize=None)
 def _optimal_param(threshold, num_perm, false_positive_weight, false_negative_weight):
     """Compute the optimal `MinHashLSH` parameter that minimizes the weighted sum
     of probabilities of false positive and false negative.
@@ -527,12 +529,12 @@ class MinHashLSH:
         return any(t.size() == 0 for t in self.hashtables)
 
     def _byteswap(self, hs):
-        return bytes(hs.byteswap().data)
+        return hs.data.tobytes()
 
     def _hashed_byteswap(self, hs):
         if self.hashfunc is None:
             raise RuntimeError("Hash function not configured.")
-        return self.hashfunc(bytes(hs.byteswap().data))
+        return self.hashfunc(hs.data.tobytes())
 
     def _query_b(self, minhash, b):
         if len(minhash) != self.h:

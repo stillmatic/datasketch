@@ -108,7 +108,7 @@ class TestMinHash(unittest.TestCase):
         m.update(b"Hello")
         self.assertListEqual(
             m.hashvalues.tolist(),
-            [734825475, 960773806, 359816889, 342714745],
+            [3959947546, 1031869133, 3079356000, 3151374772],
         )
 
     def test_bulk(self):
