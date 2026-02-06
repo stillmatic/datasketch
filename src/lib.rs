@@ -99,8 +99,8 @@ fn hll_update<'py>(
     let reg_index = (hv & (m - 1)) as usize;
     let bits = hv >> p;
     let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
-    let rank = max_rank - bit_len + 1;
-    if rank == 0 || rank > max_rank {
+    let rank = (max_rank as i16) - (bit_len as i16) + 1;
+    if rank <= 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             format!("Hash value overflow, maximum size is {} bits", max_rank),
         ));
@@ -109,7 +109,7 @@ fn hll_update<'py>(
     // SAFETY: we have exclusive access through Python's GIL
     let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
     if (rank as i8) > reg_arr[reg_index] {
-        reg_arr[reg_index] = rank as i8;
+        reg_arr[reg_index] = rank as i8;  // rank is guaranteed > 0 and fits in i8
     }
     Ok(())
 }
@@ -137,7 +137,7 @@ fn hll_update_batch<'py>(
         let bits = hv >> p;
         let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
         let rank = max_rank - bit_len + 1;
-        if rank == 0 || rank > max_rank {
+        if rank == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Hash value overflow, maximum size is {} bits", max_rank),
             ));
@@ -165,8 +165,8 @@ fn hll64_update<'py>(
     let reg_index = (hv & (m - 1)) as usize;
     let bits = hv >> p;
     let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
-    let rank = max_rank - bit_len + 1;
-    if rank == 0 || rank > max_rank {
+    let rank = (max_rank as i16) - (bit_len as i16) + 1;
+    if rank <= 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             format!("Hash value overflow, maximum size is {} bits", max_rank),
         ));
@@ -174,7 +174,7 @@ fn hll64_update<'py>(
 
     let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
     if (rank as i8) > reg_arr[reg_index] {
-        reg_arr[reg_index] = rank as i8;
+        reg_arr[reg_index] = rank as i8;  // rank is guaranteed > 0 and fits in i8
     }
     Ok(())
 }
@@ -201,7 +201,7 @@ fn hll64_update_batch<'py>(
         let bits = hv >> p;
         let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
         let rank = max_rank - bit_len + 1;
-        if rank == 0 || rank > max_rank {
+        if rank == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Hash value overflow, maximum size is {} bits", max_rank),
             ));
