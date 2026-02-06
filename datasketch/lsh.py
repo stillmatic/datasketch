@@ -427,8 +427,7 @@ class MinHashLSH:
         candidates = set()
         for (start, end), hashtable in zip(self.hashranges, self.hashtables):
             H = self._H(minhash.hashvalues[start:end])
-            for key in hashtable.get(H):
-                candidates.add(key)
+            candidates.update(hashtable.get(H))
         if self.prepickle:
             return [pickle.loads(key) for key in candidates]
         return list(candidates)

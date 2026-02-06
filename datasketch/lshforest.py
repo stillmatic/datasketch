@@ -141,8 +141,7 @@ class MinHashLSHForest:
         hashvalue_byte_size = len(byteslist[0]) // 8
         hashvalues = np.empty(len(byteslist) * hashvalue_byte_size, dtype=np.uint64)
         for index, item in enumerate(byteslist):
-            # unswap the bytes, as their representation is flipped during storage
-            hv_segment = np.frombuffer(item, dtype=np.uint64).byteswap()
+            hv_segment = np.frombuffer(item, dtype=np.uint64)
             curr_index = index * hashvalue_byte_size
             hashvalues[curr_index : curr_index + hashvalue_byte_size] = hv_segment
         return hashvalues
@@ -169,7 +168,7 @@ class MinHashLSHForest:
         return any(len(t) == 0 for t in self.sorted_hashtables)
 
     def _H(self, hs):
-        return bytes(hs.byteswap().data)
+        return hs.data.tobytes()
 
     def __contains__(self, key: Hashable) -> bool:
         """Returns:
