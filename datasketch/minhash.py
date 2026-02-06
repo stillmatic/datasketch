@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import warnings
 from collections.abc import Generator, Iterable
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -27,6 +28,8 @@ from datasketch.hashfunc import sha1_hash32
 try:
     from datasketch._rs import minhash_update as _rs_minhash_update
     from datasketch._rs import minhash_update_batch as _rs_minhash_update_batch
+    from datasketch._rs import minhash_bulk_from_hashes as _rs_minhash_bulk_from_hashes
+    from datasketch._rs import xxhash32 as _rs_xxhash32
 
     _HAS_RS = True
 except ImportError:
@@ -42,6 +45,16 @@ _hash_range = 1 << 32
 
 
 _GPU_OK_CACHE: Optional[bool] = None
+
+
+@functools.lru_cache(maxsize=16)
+def _cached_permutations(num_perm: int, seed: int) -> np.ndarray:
+    gen = np.random.RandomState(seed)
+    a = gen.randint(1, _mersenne_prime, dtype=np.uint64, size=num_perm)
+    b = gen.randint(0, _mersenne_prime, dtype=np.uint64, size=num_perm)
+    arr = np.array([a, b], dtype=np.uint64)
+    arr.flags.writeable = False
+    return arr
 
 
 def _gpu_available() -> bool:
@@ -180,13 +193,7 @@ class MinHash:
         return np.ones(num_perm, dtype=np.uint64) * _max_hash
 
     def _init_permutations(self, num_perm: int) -> np.ndarray:
-        # Create parameters for a random bijective permutation function
-        # that maps a 32-bit hash value to another 32-bit hash value.
-        # http://en.wikipedia.org/wiki/Universal_hashing
-        gen = np.random.RandomState(self.seed)
-        a = gen.randint(1, _mersenne_prime, dtype=np.uint64, size=num_perm)
-        b = gen.randint(0, _mersenne_prime, dtype=np.uint64, size=num_perm)
-        return np.array([a, b], dtype=np.uint64)
+        return _cached_permutations(num_perm, self.seed)
 
     def _parse_hashvalues(self, hashvalues) -> np.ndarray:
         return np.array(hashvalues, dtype=np.uint64)
@@ -223,7 +230,7 @@ class MinHash:
                 minhash.update("new value")
 
         """
-        if self._use_rs:
+        if self._use_rs and isinstance(b, (bytes, bytearray)):
             a, b_perm = self.permutations
             _rs_minhash_update(b, a, b_perm, self.hashvalues)
             return
@@ -272,9 +279,11 @@ class MinHash:
             data_list = list(b)
             if not data_list:
                 return
-            a, b_perm = self.permutations
-            _rs_minhash_update_batch(data_list, a, b_perm, self.hashvalues)
-            return
+            # Rust path only works with bytes/bytearray items
+            if isinstance(data_list[0], (bytes, bytearray)):
+                a, b_perm = self.permutations
+                _rs_minhash_update_batch(data_list, a, b_perm, self.hashvalues)
+                return
 
         # Hash on CPU to preserve hashfunc semantics
         hv_list = [self.hashfunc(_b) for _b in b]
@@ -482,6 +491,9 @@ class MinHash:
         overhead when initializing many minhashes by reusing the initialized
         state.
 
+        When the Rust extension is available, all MinHashes are computed in
+        parallel using Rayon with the GIL released.
+
         Args:
             b (Iterable): An Iterable of lists of bytes, each list is
                 hashed in to one MinHash in the output.
@@ -501,6 +513,49 @@ class MinHash:
                 minhashes = MinHash.bulk(data, num_perm=64)
 
         """
+        template = cls(**minhash_kwargs)
+        if template._use_rs:
+            data_lists = list(b)
+            if not data_lists:
+                return []
+            # Fast path requires bytes items; fall back for other types
+            try:
+                first_item = data_lists[0][0]
+            except (IndexError, TypeError):
+                first_item = None
+            if isinstance(first_item, (bytes, bytearray)):
+                perm_a, perm_b = template.permutations
+                num_perm = len(perm_a)
+                n = len(data_lists)
+                # Pre-hash all items with xxhash32
+                total = sum(len(items) for items in data_lists)
+                hashes = np.empty(total, dtype=np.uint32)
+                offsets = np.empty(n + 1, dtype=np.uint64)
+                offsets[0] = 0
+                idx = 0
+                for i, items in enumerate(data_lists):
+                    for item in items:
+                        hashes[idx] = _rs_xxhash32(item)
+                        idx += 1
+                    offsets[i + 1] = idx
+                # Parallel permutation in Rust
+                flat = _rs_minhash_bulk_from_hashes(
+                    hashes, offsets, perm_a, perm_b
+                )
+                # Build MinHash objects from flat result
+                result = []
+                for i in range(n):
+                    hv = np.array(
+                        flat[i * num_perm : (i + 1) * num_perm], dtype=np.uint64
+                    )
+                    _m = cls(
+                        hashvalues=hv,
+                        permutations=template.permutations,
+                        seed=template.seed,
+                        hashfunc=template.hashfunc,
+                    )
+                    result.append(_m)
+                return result
         return list(cls.generator(b, **minhash_kwargs))
 
     @classmethod

@@ -111,8 +111,16 @@ class TestMinHashBench:
 
     # -- bulk creation --
 
-    def test_bulk(self, benchmark):
-        data = [_make_bytes_list(50) for _ in range(100)]
+    @pytest.mark.parametrize(
+        "n_minhashes,set_size",
+        [(100, 50), (1_000, 200), (5_000, 200)],
+    )
+    def test_bulk(self, benchmark, n_minhashes, set_size):
+        rng = np.random.RandomState(42)
+        data = [
+            [_make_bytes(x) for x in rng.randint(0, n_minhashes * 10, size=set_size)]
+            for _ in range(n_minhashes)
+        ]
         benchmark(MinHash.bulk, data, num_perm=128)
 
 
@@ -250,19 +258,54 @@ class TestMinHashLSHBench:
 
     # -- end-to-end: insert N + query --
 
-    @pytest.mark.parametrize("n_items", [1_000, 5_000])
-    def test_end_to_end(self, benchmark, n_items):
+    @pytest.mark.parametrize(
+        "n_items,set_size",
+        [(1_000, 20), (1_000, 200), (1_000, 1_000), (5_000, 20), (5_000, 200)],
+    )
+    def test_end_to_end(self, benchmark, n_items, set_size):
         num_perm = 128
+        # Pre-generate data outside the benchmark loop
+        rng = np.random.RandomState(42)
+        all_items = [
+            [_make_bytes(x) for x in rng.randint(0, n_items * 10, size=set_size)]
+            for _ in range(n_items)
+        ]
 
         def workflow():
             lsh = MinHashLSH(threshold=0.5, num_perm=num_perm)
-            rng = np.random.RandomState(42)
             minhashes = []
-            for i in range(n_items):
+            for i, items in enumerate(all_items):
                 m = MinHash(num_perm=num_perm)
-                items = [_make_bytes(x) for x in rng.randint(0, n_items * 10, size=20)]
                 m.update_batch(items)
                 minhashes.append(m)
+                lsh.insert(i, m, check_duplication=False)
+            # Query with first 10
+            results = []
+            for m in minhashes[:10]:
+                results.append(lsh.query(m))
+            return results
+
+        benchmark(workflow)
+
+    # -- end-to-end using MinHash.bulk: bulk create + insert + query --
+
+    @pytest.mark.parametrize(
+        "n_items,set_size",
+        [(1_000, 20), (1_000, 200), (1_000, 1_000), (5_000, 20), (5_000, 200)],
+    )
+    def test_end_to_end_bulk(self, benchmark, n_items, set_size):
+        num_perm = 128
+        # Pre-generate data outside the benchmark loop
+        rng = np.random.RandomState(42)
+        all_items = [
+            [_make_bytes(x) for x in rng.randint(0, n_items * 10, size=set_size)]
+            for _ in range(n_items)
+        ]
+
+        def workflow():
+            lsh = MinHashLSH(threshold=0.5, num_perm=num_perm)
+            minhashes = MinHash.bulk(all_items, num_perm=num_perm)
+            for i, m in enumerate(minhashes):
                 lsh.insert(i, m, check_duplication=False)
             # Query with first 10
             results = []

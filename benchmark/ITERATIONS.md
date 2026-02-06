@@ -149,21 +149,64 @@ speedup on smaller batches is purely from fast Mersenne elimination of the
 
 ---
 
-## Cumulative Speedup Summary (Baseline to Iteration 4)
+## Iteration 5: Permutation Cache + Rayon Bulk API (`0007_iteration5_bulk`)
+
+**Commit:** (this commit)
+
+Changes:
+1. **Cached `_init_permutations`** (`minhash.py`) — `@functools.lru_cache` on `(num_perm, seed)`. Since all MinHashes with the same seed share identical permutations, this avoids recreating `np.random.RandomState` (~77 us) on every init
+2. **`minhash_bulk_from_hashes` Rust function** (`src/lib.rs`) — takes pre-hashed u32 values + offsets array, applies permutations in parallel with Rayon across N independent MinHashes
+3. **Updated `MinHash.bulk` to use Rust fast path** (`minhash.py`) — pre-hashes all items with xxhash32, passes hash+offset arrays to Rust, builds MinHash objects from flat result
+4. **Fixed Rust path type guards** (`minhash.py`) — `update()`, `update_batch()`, and `bulk()` now check for `bytes`/`bytearray` before using Rust path, falling back to Python for other types (numpy arrays, etc.)
+5. **Improved end-to-end benchmark** (`bench_core.py`) — moved data generation outside timed section, added `set_size` parameter axis, added `test_end_to_end_bulk` variant
+
+Time breakdown analysis (5000 items × 200 per set, profiled):
+| Component | Before (iter 4) | After |
+|---|---|---|
+| MinHash init (5000x) | 458 ms (39%) | 12 ms (2%) |
+| update_batch (5000x) | 344 ms (63%) | — (folded into bulk) |
+| MinHash.bulk (5000×200) | — | 184 ms total |
+| LSH insert (5000x) | 193 ms | ~38 ms |
+
+Impact — end-to-end (data generation excluded from timing):
+
+| Benchmark | Sequential | Bulk | Speedup |
+|---|---|---|---|
+| end_to_end (1000, 20) | 22.8 ms | 20.4 ms | 1.1x |
+| end_to_end (1000, 200) | 75.4 ms | 36.8 ms | **2.0x** |
+| end_to_end (1000, 1000) | 314.9 ms | 109.1 ms | **2.9x** |
+| end_to_end (5000, 20) | 131.8 ms | 110.1 ms | 1.2x |
+| end_to_end (5000, 200) | 417.7 ms | 184.3 ms | **2.3x** |
+
+The permutation cache alone dropped MinHash init from ~92 us to ~1.5 us
+(~60x). The Rayon bulk API then parallelizes the permutation step across
+all N MinHashes — this is most impactful at larger set sizes where per-
+MinHash work is significant.
+
+---
+
+## Cumulative Speedup Summary (Baseline to Iteration 5)
 
 | Benchmark | Baseline | Current | Total Speedup |
 |---|---|---|---|
-| LSH init (0.5, 128) | 6,845 us | 42 us | **163x** |
-| LSH init (0.5, 256) | 22,426 us | 123 us | **182x** |
-| MinHash init (128 perm) | 234 us | 77 us | **3x** |
-| MinHash update_batch (128, 1k) | 465 us | 226 us | **2.1x** |
-| MinHash update_batch (256, 10k) | 8,520 us | 2,561 us | **3.3x** |
-| LSH query (small) | 17.4 us | 8.5 us | **2.0x** |
-| LSH query (medium) | 14.5 us | 7.7 us | **1.9x** |
-| LSH insert (128 perm) | 22.4 us | 15.7 us | **1.4x** |
-| HLL update (p=12) | 640 ns | ~50 ns (Rust) | **~13x** |
-| end_to_end (1000 items) | 421 ms | 142 ms | **3.0x** |
-| end_to_end (5000 items) | 2,205 ms | 707 ms | **3.1x** |
+| LSH init (0.5, 128) | 6,845 us | 8 us | **~850x** |
+| LSH init (0.5, 256) | 22,426 us | 13 us | **~1700x** |
+| MinHash init (128 perm) | 234 us | 1.5 us | **~156x** |
+| MinHash update_batch (128, 1k) | 465 us | 225 us | **2.1x** |
+| MinHash update_batch (256, 10k) | 8,520 us | 2,372 us | **3.6x** |
+| MinHash.bulk (1000, 200) | — | 28 ms | new API |
+| MinHash.bulk (5000, 200) | — | 146 ms | new API |
+| LSH query (small) | 17.4 us | 8.1 us | **2.1x** |
+| LSH query (medium) | 14.5 us | 7.4 us | **2.0x** |
+| LSH insert (128 perm) | 22.4 us | 11.0 us | **2.0x** |
+| HLL update (p=12) | 640 ns | ~91 ns (Rust) | **~7x** |
+| end_to_end seq (1000, 200) | — | 75 ms | new config |
+| end_to_end bulk (1000, 200) | — | 37 ms | new config |
+| end_to_end bulk (5000, 200) | — | 184 ms | new config |
+
+Note: end_to_end timings now exclude data generation (was included in baseline).
+The original baseline end_to_end (1000, 20) was 421 ms including data gen;
+the equivalent sequential benchmark now measures 23 ms without data gen.
 
 ---
 
@@ -173,6 +216,7 @@ Remaining optimization opportunities (roughly ordered by impact/effort):
 
 | Opportunity | Module | Est. Impact | Effort |
 |---|---|---|---|
+| Fuse bulk create + LSH insert in Rust | `src/lib.rs`, `lsh.py` | 30-50% e2e | High |
 | Vectorize WeightedMinHash `minhash()` loop | `weighted_minhash.py` | 40-60% | Medium |
 | Redis `mget` pipeline in storage | `storage.py` | 50-70% (Redis only) | Medium |
 | NumPy `searchsorted` in LSHForest | `lshforest.py` | 20-30% | Low |

@@ -315,6 +315,60 @@ fn hll64_update_batch<'py>(
 }
 
 // --------------------------------------------------------------------------
+// Bulk MinHash creation (Rayon-parallel across MinHashes, GIL-released)
+// --------------------------------------------------------------------------
+
+/// Create N MinHashes in parallel from pre-computed hash values.
+///
+/// Takes a flat array of u32 hash values and an offsets array that
+/// delimits which hashes belong to each MinHash. Returns a flat
+/// Vec<u64> of length N * num_perm.
+///
+/// This avoids the expensive Python→Rust conversion of nested byte lists
+/// by accepting pre-hashed values (via xxhash32) as numpy arrays.
+#[pyfunction]
+fn minhash_bulk_from_hashes<'py>(
+    py: Python<'py>,
+    hashes: PyReadonlyArray1<'py, u32>,
+    offsets: PyReadonlyArray1<'py, u64>,
+    a: PyReadonlyArray1<'py, u64>,
+    b: PyReadonlyArray1<'py, u64>,
+) -> Vec<u64> {
+    let h_slice = hashes.as_array();
+    let h_data = h_slice.as_slice().unwrap();
+    let off_slice = offsets.as_array();
+    let off_data = off_slice.as_slice().unwrap();
+    let a_arr = a.as_array();
+    let b_arr = b.as_array();
+    let a_data = a_arr.as_slice().unwrap();
+    let b_data = b_arr.as_slice().unwrap();
+    let num_perm = a_data.len();
+    let n = off_data.len() - 1; // number of MinHashes
+
+    // Copy permutation arrays for Rayon (need Send)
+    let a_vec: Vec<u64> = a_data.to_vec();
+    let b_vec: Vec<u64> = b_data.to_vec();
+    // Copy hash data for Rayon (numpy array isn't Send)
+    let h_vec: Vec<u32> = h_data.to_vec();
+    let off_vec: Vec<u64> = off_data.to_vec();
+
+    py.allow_threads(|| {
+        let mut out = vec![MAX_HASH; n * num_perm];
+        out.par_chunks_mut(num_perm)
+            .enumerate()
+            .for_each(|(i, hv_row)| {
+                let start = off_vec[i] as usize;
+                let end = off_vec[i + 1] as usize;
+                for j in start..end {
+                    let h = unsafe { *h_vec.get_unchecked(j) } as u64;
+                    permute_min_into(h, &a_vec, &b_vec, hv_row);
+                }
+            });
+        out
+    })
+}
+
+// --------------------------------------------------------------------------
 // Module
 // --------------------------------------------------------------------------
 
@@ -328,5 +382,6 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hll_update_batch, m)?)?;
     m.add_function(wrap_pyfunction!(hll64_update, m)?)?;
     m.add_function(wrap_pyfunction!(hll64_update_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(minhash_bulk_from_hashes, m)?)?;
     Ok(())
 }
