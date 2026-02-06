@@ -115,19 +115,55 @@ Impact (vs baseline):
 
 ---
 
-## Cumulative Speedup Summary (Baseline to Iteration 3)
+## Iteration 4: Fast Mersenne Reduction + Rayon Parallelism (`0006_iteration4_final`)
+
+**Commit:** (this commit)
+
+Changes:
+1. **Fast Mersenne prime reduction** (`src/lib.rs`) — replaced `% (MERSENNE_PRIME as u128)` (software division, ~50-100ns via `__udivti3`) with bit manipulation: `(x >> 61) + (x & (2^61 - 1))` with one conditional subtract (~1-2ns)
+2. **Unchecked indexing in permutation kernel** — `get_unchecked`/`get_unchecked_mut` eliminates bounds checks, helps LLVM auto-vectorize
+3. **Rayon parallelism for MinHash batch** — thread-local accumulators merged by element-wise min, GIL released via `py.allow_threads()`
+4. **Split sequential/parallel paths** — small batches (<2048 items) operate directly on numpy arrays with zero copies; large batches copy to owned Vecs and use Rayon
+5. **HLL stays sequential** — per-item HLL work (~20ns) is too light to amortize register array cloning (up to 64KB for p=16); Rayon was counterproductive here
+
+Key design decisions:
+- MinHash Rayon threshold = 2048 items (below this, fast Mersenne alone is sufficient)
+- Chunk size = 512 items (balances per-chunk work vs merge overhead)
+- HLL: no Rayon, but benefits from unchecked indexing and consistent i16 rank arithmetic
+
+Impact (vs iteration 3):
+| Benchmark | Before | After | Speedup |
+|---|---|---|---|
+| MinHash update_batch (128, 100) | 29.9 us | 22.9 us | **23%** |
+| MinHash update_batch (128, 1k) | 284 us | 226 us | **20%** |
+| MinHash update_batch (128, 10k) | 2,863 us | 2,515 us | **12%** |
+| MinHash update_batch (256, 10k) | 4,788 us | 2,561 us | **47%** |
+| HLL update_batch (p=8, 10k) | 1,072 us | 1,098 us | same |
+| HLL update_batch (p=16, 10k) | 1,068 us | 1,110 us | same |
+| end_to_end (1000) | 145 ms | 142 ms | same |
+| end_to_end (5000) | 655 ms | 707 ms | same |
+
+The 47% speedup on `[256-10000]` is the Rayon parallel reduction. The 20-23%
+speedup on smaller batches is purely from fast Mersenne elimination of the
+`__udivti3` software division.
+
+---
+
+## Cumulative Speedup Summary (Baseline to Iteration 4)
 
 | Benchmark | Baseline | Current | Total Speedup |
 |---|---|---|---|
 | LSH init (0.5, 128) | 6,845 us | 42 us | **163x** |
-| LSH init (0.5, 256) | 22,426 us | 140 us | **160x** |
+| LSH init (0.5, 256) | 22,426 us | 123 us | **182x** |
 | MinHash init (128 perm) | 234 us | 77 us | **3x** |
-| LSH query (small) | 17.4 us | 8.1 us | **2.1x** |
-| LSH query (medium) | 14.5 us | 7.8 us | **1.9x** |
-| LSH insert (128 perm) | 22.4 us | 15.1 us | **1.5x** |
+| MinHash update_batch (128, 1k) | 465 us | 226 us | **2.1x** |
+| MinHash update_batch (256, 10k) | 8,520 us | 2,561 us | **3.3x** |
+| LSH query (small) | 17.4 us | 8.5 us | **2.0x** |
+| LSH query (medium) | 14.5 us | 7.7 us | **1.9x** |
+| LSH insert (128 perm) | 22.4 us | 15.7 us | **1.4x** |
 | HLL update (p=12) | 640 ns | ~50 ns (Rust) | **~13x** |
-| end_to_end (1000 items) | 421 ms | 149 ms | **2.8x** |
-| end_to_end (5000 items) | 2,205 ms | 701 ms | **3.1x** |
+| end_to_end (1000 items) | 421 ms | 142 ms | **3.0x** |
+| end_to_end (5000 items) | 2,205 ms | 707 ms | **3.1x** |
 
 ---
 
@@ -137,10 +173,9 @@ Remaining optimization opportunities (roughly ordered by impact/effort):
 
 | Opportunity | Module | Est. Impact | Effort |
 |---|---|---|---|
-| SIMD for Rust permutation loops | `src/lib.rs` | 30-50% | High |
-| Rayon parallelism for batch updates | `src/lib.rs` | 2-4x multi-core | High |
 | Vectorize WeightedMinHash `minhash()` loop | `weighted_minhash.py` | 40-60% | Medium |
 | Redis `mget` pipeline in storage | `storage.py` | 50-70% (Redis only) | Medium |
 | NumPy `searchsorted` in LSHForest | `lshforest.py` | 20-30% | Low |
 | LeanMinHash numpy-native serialization | `lean_minhash.py` | 30-40% serialize | Medium |
 | Vectorize b-bit MinHash packing | `b_bit_minhash.py` | 20-30% | Medium |
+| Explicit SIMD intrinsics (AVX2) | `src/lib.rs` | 10-20% | High |

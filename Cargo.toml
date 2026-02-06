@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
 numpy = "0.22"
+rayon = "1.10"

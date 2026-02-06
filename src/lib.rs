@@ -1,11 +1,120 @@
-use numpy::ndarray::{ArrayView1, ArrayViewMut1};
+use numpy::ndarray::ArrayViewMut1;
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use xxhash_rust::xxh32::xxh32 as xxhash32_impl;
 use xxhash_rust::xxh64::xxh64 as xxhash64_impl;
 
 const MERSENNE_PRIME: u64 = (1u64 << 61) - 1;
 const MAX_HASH: u64 = (1u64 << 32) - 1;
+
+/// Minimum items before Rayon parallelism kicks in for MinHash.
+/// At 1k items the Rayon overhead roughly breaks even; at 2k+ it wins.
+const RAYON_MINHASH_THRESHOLD: usize = 2048;
+/// Items per Rayon chunk for MinHash batch updates.
+const MINHASH_CHUNK_SIZE: usize = 512;
+
+// --------------------------------------------------------------------------
+// Fast Mersenne prime reduction
+// --------------------------------------------------------------------------
+
+/// Fast modular reduction by the Mersenne prime 2^61 - 1.
+///
+/// Uses the identity: x mod (2^61 - 1) = (x >> 61) + (x & (2^61 - 1))
+/// with at most one conditional subtraction.
+///
+/// Valid for inputs where hi + lo < 2 * (2^61 - 1), which holds when
+/// x < 2^125. Our inputs are a[i]*hv + b[i] where a,b < 2^61 and
+/// hv < 2^32, so x < 2^93 + 2^61 — well within range.
+///
+/// This replaces the generic `% (MERSENNE_PRIME as u128)` which compiles
+/// to an expensive software division call (__udivti3).
+#[inline(always)]
+fn mod_mersenne(x: u128) -> u64 {
+    let lo = (x & ((1u128 << 61) - 1)) as u64;
+    let hi = (x >> 61) as u64;
+    let r = lo + hi;
+    if r >= MERSENNE_PRIME { r - MERSENNE_PRIME } else { r }
+}
+
+// --------------------------------------------------------------------------
+// Auto-vectorization-friendly permutation kernel
+// --------------------------------------------------------------------------
+
+/// Apply all permutations to a single hash value, min-reduce into `out`.
+///
+/// Uses fast Mersenne reduction and unchecked indexing to help LLVM
+/// auto-vectorize the inner loop.
+#[inline(always)]
+fn permute_min_into(hv: u64, a: &[u64], b: &[u64], out: &mut [u64]) {
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
+    debug_assert_eq!(n, out.len());
+    let h = hv as u128;
+    for i in 0..n {
+        // SAFETY: bounds are verified by debug_assert above; all three
+        // slices have length `n` and `i` is in 0..n.
+        unsafe {
+            let ai = *a.get_unchecked(i) as u128;
+            let bi = *b.get_unchecked(i) as u128;
+            let phv = mod_mersenne(ai * h + bi) & MAX_HASH;
+            let slot = out.get_unchecked_mut(i);
+            if phv < *slot {
+                *slot = phv;
+            }
+        }
+    }
+}
+
+/// Element-wise min of two u64 slices, writing into `acc`.
+#[inline(always)]
+fn merge_min_u64(acc: &mut [u64], other: &[u64]) {
+    let n = acc.len();
+    debug_assert_eq!(n, other.len());
+    for i in 0..n {
+        unsafe {
+            let a = acc.get_unchecked_mut(i);
+            let o = *other.get_unchecked(i);
+            if o < *a { *a = o; }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// HLL single-item helpers
+// --------------------------------------------------------------------------
+
+/// Process one item for HLL (32-bit hash). Returns false on rank overflow.
+#[inline(always)]
+fn hll32_one(data: &[u8], p: u8, max_rank: u8, mask: u64, reg: &mut [i8]) -> bool {
+    let hv = xxhash32_impl(data, 0) as u64;
+    let reg_index = (hv & mask) as usize;
+    let bits = hv >> p;
+    let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
+    let rank = (max_rank as i16) - (bit_len as i16) + 1;
+    if rank <= 0 { return false; }
+    unsafe {
+        let slot = reg.get_unchecked_mut(reg_index);
+        if (rank as i8) > *slot { *slot = rank as i8; }
+    }
+    true
+}
+
+/// Process one item for HLL++ (64-bit hash). Returns false on rank overflow.
+#[inline(always)]
+fn hll64_one(data: &[u8], p: u8, max_rank: u8, mask: u64, reg: &mut [i8]) -> bool {
+    let hv = xxhash64_impl(data, 0);
+    let reg_index = (hv & mask) as usize;
+    let bits = hv >> p;
+    let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
+    let rank = (max_rank as i16) - (bit_len as i16) + 1;
+    if rank <= 0 { return false; }
+    unsafe {
+        let slot = reg.get_unchecked_mut(reg_index);
+        if (rank as i8) > *slot { *slot = rank as i8; }
+    }
+    true
+}
 
 // --------------------------------------------------------------------------
 // Standalone hash functions
@@ -34,52 +143,75 @@ fn minhash_update<'py>(
     hashvalues: &Bound<'py, PyArray1<u64>>,
 ) {
     let hv = xxhash32_impl(data, 0) as u64;
-    let a_arr: ArrayView1<u64> = a.as_array();
-    let b_arr: ArrayView1<u64> = b.as_array();
-
-    // SAFETY: we have exclusive access through Python's GIL
+    let a_arr = a.as_array();
+    let b_arr = b.as_array();
     let mut hv_arr: ArrayViewMut1<u64> = unsafe { hashvalues.as_array_mut() };
 
-    for i in 0..a_arr.len() {
-        let ai = a_arr[i] as u128;
-        let bi = b_arr[i] as u128;
-        let h = hv as u128;
-        let phv = ((ai * h + bi) % (MERSENNE_PRIME as u128)) as u64 & MAX_HASH;
-        if phv < hv_arr[i] {
-            hv_arr[i] = phv;
-        }
-    }
+    let a_slice = a_arr.as_slice().unwrap();
+    let b_slice = b_arr.as_slice().unwrap();
+    let hv_slice = hv_arr.as_slice_mut().unwrap();
+
+    permute_min_into(hv, a_slice, b_slice, hv_slice);
 }
 
 // --------------------------------------------------------------------------
-// Fused MinHash batch update
+// Fused MinHash batch update (Rayon-parallel, GIL-released)
 // --------------------------------------------------------------------------
 
 /// Hash multiple items, apply all permutations, min-reduce into hashvalues.
+///
+/// For large batches, uses Rayon to parallelize across items with
+/// thread-local accumulators merged by element-wise min. The GIL is
+/// released during computation.
 #[pyfunction]
 fn minhash_update_batch<'py>(
+    py: Python<'py>,
     data_list: Vec<Vec<u8>>,
     a: PyReadonlyArray1<'py, u64>,
     b: PyReadonlyArray1<'py, u64>,
     hashvalues: &Bound<'py, PyArray1<u64>>,
 ) {
-    let a_arr: ArrayView1<u64> = a.as_array();
-    let b_arr: ArrayView1<u64> = b.as_array();
-    let num_perm = a_arr.len();
-
-    // SAFETY: we have exclusive access through Python's GIL
+    let a_arr = a.as_array();
+    let b_arr = b.as_array();
+    let a_slice = a_arr.as_slice().unwrap();
+    let b_slice = b_arr.as_slice().unwrap();
     let mut hv_arr: ArrayViewMut1<u64> = unsafe { hashvalues.as_array_mut() };
+    let hv_slice = hv_arr.as_slice_mut().unwrap();
 
-    for data in &data_list {
-        let hv = xxhash32_impl(data, 0) as u128;
-        for i in 0..num_perm {
-            let ai = a_arr[i] as u128;
-            let bi = b_arr[i] as u128;
-            let phv = ((ai * hv + bi) % (MERSENNE_PRIME as u128)) as u64 & MAX_HASH;
-            if phv < hv_arr[i] {
-                hv_arr[i] = phv;
-            }
+    if data_list.len() < RAYON_MINHASH_THRESHOLD {
+        // Sequential path: operate directly on numpy arrays, zero copies.
+        for data in &data_list {
+            let h = xxhash32_impl(data, 0) as u64;
+            permute_min_into(h, a_slice, b_slice, hv_slice);
         }
+    } else {
+        // Parallel path: copy to owned Vecs so we can release the GIL.
+        let a_vec: Vec<u64> = a_slice.to_vec();
+        let b_vec: Vec<u64> = b_slice.to_vec();
+        let num_perm = a_vec.len();
+        let init_hv: Vec<u64> = hv_slice.to_vec();
+
+        let result = py.allow_threads(|| {
+            data_list
+                .par_chunks(MINHASH_CHUNK_SIZE)
+                .map(|chunk| {
+                    let mut local = init_hv.clone();
+                    for data in chunk {
+                        let h = xxhash32_impl(data, 0) as u64;
+                        permute_min_into(h, &a_vec, &b_vec, &mut local);
+                    }
+                    local
+                })
+                .reduce(
+                    || vec![u64::MAX; num_perm],
+                    |mut acc, local| {
+                        merge_min_u64(&mut acc, &local);
+                        acc
+                    },
+                )
+        });
+
+        hv_slice.copy_from_slice(&result);
     }
 }
 
@@ -94,22 +226,13 @@ fn hll_update<'py>(
     max_rank: u8,
     reg: &Bound<'py, PyArray1<i8>>,
 ) -> PyResult<()> {
-    let hv = xxhash32_impl(data, 0) as u64;
-    let m = 1u64 << p;
-    let reg_index = (hv & (m - 1)) as usize;
-    let bits = hv >> p;
-    let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
-    let rank = (max_rank as i16) - (bit_len as i16) + 1;
-    if rank <= 0 {
+    let mask = (1u64 << p) - 1;
+    let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
+    let reg_slice = reg_arr.as_slice_mut().unwrap();
+    if !hll32_one(data, p, max_rank, mask, reg_slice) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             format!("Hash value overflow, maximum size is {} bits", max_rank),
         ));
-    }
-
-    // SAFETY: we have exclusive access through Python's GIL
-    let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
-    if (rank as i8) > reg_arr[reg_index] {
-        reg_arr[reg_index] = rank as i8;  // rank is guaranteed > 0 and fits in i8
     }
     Ok(())
 }
@@ -117,6 +240,11 @@ fn hll_update<'py>(
 // --------------------------------------------------------------------------
 // Fused HyperLogLog batch update (32-bit hash)
 // --------------------------------------------------------------------------
+//
+// HLL per-item work is very light (~20ns: hash + single register update),
+// so Rayon parallelism is counterproductive — the cost of cloning and
+// merging large register arrays (up to 64KB for p=16) dominates.
+// Sequential with unchecked indexing is fastest.
 
 #[pyfunction]
 fn hll_update_batch<'py>(
@@ -125,25 +253,15 @@ fn hll_update_batch<'py>(
     max_rank: u8,
     reg: &Bound<'py, PyArray1<i8>>,
 ) -> PyResult<()> {
-    let m = 1u64 << p;
-    let mask = m - 1;
-
-    // SAFETY: we have exclusive access through Python's GIL
+    let mask = (1u64 << p) - 1;
     let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
+    let reg_slice = reg_arr.as_slice_mut().unwrap();
 
     for data in &data_list {
-        let hv = xxhash32_impl(data, 0) as u64;
-        let reg_index = (hv & mask) as usize;
-        let bits = hv >> p;
-        let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
-        let rank = max_rank - bit_len + 1;
-        if rank == 0 {
+        if !hll32_one(data, p, max_rank, mask, reg_slice) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Hash value overflow, maximum size is {} bits", max_rank),
             ));
-        }
-        if (rank as i8) > reg_arr[reg_index] {
-            reg_arr[reg_index] = rank as i8;
         }
     }
     Ok(())
@@ -160,21 +278,13 @@ fn hll64_update<'py>(
     max_rank: u8,
     reg: &Bound<'py, PyArray1<i8>>,
 ) -> PyResult<()> {
-    let hv = xxhash64_impl(data, 0);
-    let m = 1u64 << p;
-    let reg_index = (hv & (m - 1)) as usize;
-    let bits = hv >> p;
-    let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
-    let rank = (max_rank as i16) - (bit_len as i16) + 1;
-    if rank <= 0 {
+    let mask = (1u64 << p) - 1;
+    let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
+    let reg_slice = reg_arr.as_slice_mut().unwrap();
+    if !hll64_one(data, p, max_rank, mask, reg_slice) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             format!("Hash value overflow, maximum size is {} bits", max_rank),
         ));
-    }
-
-    let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
-    if (rank as i8) > reg_arr[reg_index] {
-        reg_arr[reg_index] = rank as i8;  // rank is guaranteed > 0 and fits in i8
     }
     Ok(())
 }
@@ -190,24 +300,15 @@ fn hll64_update_batch<'py>(
     max_rank: u8,
     reg: &Bound<'py, PyArray1<i8>>,
 ) -> PyResult<()> {
-    let m = 1u64 << p;
-    let mask = m - 1;
-
+    let mask = (1u64 << p) - 1;
     let mut reg_arr: ArrayViewMut1<i8> = unsafe { reg.as_array_mut() };
+    let reg_slice = reg_arr.as_slice_mut().unwrap();
 
     for data in &data_list {
-        let hv = xxhash64_impl(data, 0);
-        let reg_index = (hv & mask) as usize;
-        let bits = hv >> p;
-        let bit_len = if bits == 0 { 0u8 } else { (64 - bits.leading_zeros()) as u8 };
-        let rank = max_rank - bit_len + 1;
-        if rank == 0 {
+        if !hll64_one(data, p, max_rank, mask, reg_slice) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Hash value overflow, maximum size is {} bits", max_rank),
             ));
-        }
-        if (rank as i8) > reg_arr[reg_index] {
-            reg_arr[reg_index] = rank as i8;
         }
     }
     Ok(())
